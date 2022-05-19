@@ -1,0 +1,755 @@
+---
+title: Forecasting football injuries by combining screening, monitoring and machine learning - 1/ 2 Data preparation and feature engineering
+author: "Anne Hecksteden & Georges Pierre Schmartz"
+date: "21 March 2022"
+output:
+  #pdf_document:
+    #toc: yes
+    #toc_depth: '5'
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    toc_depth: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = "center", echo = TRUE)
+library(data.table) # data handling
+library(tidyverse) # data handling and plotting
+library(plyr) # data handling
+library(dplyr) # data handling
+library(runner) # calculating within running / trailing time windows
+library(lme4) # fit linear model (adjusting injury history for age)
+library(knitr) # knit markdown file
+```
+
+# Read Me 
+
+This R Markdown document  provides reproducible code for data handling and feature engineering - leading from raw data to the dataset used for machine learning. The machine learning algorithm itself as well as some accompanying descriptives are presented in a second document. 
+
+Important note: The densely commented code presented here aims at transparency and accessibility - not at efficiency of coding and computation. 
+
+Please note that providing raw data is not possible due to the challenge of effective anonymization in professional football and lack of consent.
+
+# Loading raw data
+
+```{r data, eval=TRUE, echo=TRUE}
+# Clean workspace (if necessary)
+rm(list = ls())
+ggplot_theme<-theme_bw()
+
+# Load raw data
+load("Raw_data.RData")
+data <- Raw_data
+```
+
+# Generating utility variables
+## Days since study start 
+
+Study start was June first 2019
+
+```{r Days in study, eval=TRUE, echo=TRUE}
+data$Day_in_study <-difftime(data$Date, min(data$Date), units="days")
+data$Day_in_study <- data$Day_in_study + 1
+data$Day_in_study <- as.integer(data$Day_in_study)
+```
+
+## Dichotomous classification of injury status
+
+In raw data, injury status has 3 levels: fully available for training and matchplay; day of injury; and rehab (injury until return to play). Here the dichotomous variable "Unfit" is generated: FALSE = fully available for training and matchplay; TRUE = day of injury or rehab (until return to play))
+
+```{r fit vs. unfit, eval=TRUE, echo=TRUE}
+# Create Variable fit (fully available) vs. unfit (injury and rehab) 
+data$Unfit<-data$Inj_status!=0
+data$Unfit <- as.logical(data$Unfit)
+```
+
+# Generating criterion and features for machine learning
+## Criterion
+
+Injury_status = 1 includes the onset of all sorts of bodily complaints that have been reported by the players. However, only acute, non-contact, time-loss injuries are of interest here. Therefore a criterion variable "Crit" is generated. 
+
+### Precheck "Injury_status"
+
+Number of occurrences (player-days) per level of injury_status and check for missing values
+Labels: uninjured / normal availability; day of injury; rehab (injury to return-to-play)
+
+```{r Check Injury_status, eval=TRUE, echo=TRUE}
+data$Inj_status <- factor(data$Inj_status,levels = 0:2,labels = c("Available","Injury","Rehab"))
+table(data$Inj_status)
+any(is.na(data$Inj_status))
+```
+As expected the dataset is imbalanced. There are no missing values for injury_status.
+
+### Precheck "Reason"
+
+Acute vs. chronic (overload) injuries
+
+```{r}
+table(data$Reason)
+```
+### Precheck "Injury mechanism"
+
+Contact vs. Non-contact injuries
+
+```{r}
+data$Injury_mechanism <- factor(data$Injury_mechanism,levels = 0:1,labels = c("contact","non-contact"))
+table(data$Injury_mechanism)
+any(is.na(data$Injury_mechanism))
+```
+
+### Generate identifier for criterion injuries "Crit"
+
+Crit: Criterion = Day of acute, non-contact, time-loss injury (Binary: TRUE / FALSE)
+
+```{r Generate crit, eval = TRUE, echo=TRUE}
+
+data$Crit <- data$Inj_status == "Injury" & data$Injury_mechanism == "non-contact" & data$Days_off > 0 & data$Reason == "Acute" 
+data$Crit<-ifelse(!is.na(data$Crit),data$Crit,F)
+data$Crit <- as.logical(data$Crit)
+```
+
+### Postcheck
+
+Number of criterion injuries and check for missing values in Crit
+
+```{r Criterion - postcheck, eval=TRUE, echo=TRUE}
+table(data$Crit)
+any(is.na(data$Crit))
+```
+52 criterion-injuries have been recorded. There are no missing values.
+
+## Utility variable derived from Crit: Players who sustain a criterion injury vs. players who do not ("victims")
+
+This utility variably will later be needed for optimal splitting of the dataset into a training and a test set.
+
+```{r}
+# Identify "victims"
+data_victim <- filter(data, Crit)
+# Create variable "Victim"
+data$Victim<-data$ID%in%data_victim$ID
+data$Victim <- as.logical(data$Victim)
+
+table(data$Victim, data$Crit)
+```
+
+## Identify time-loss injuries for epidemiological description 
+
+Generate a variable identifying time_loss injuries ("TL_injury") as recommended for general epidemiological description. 
+
+```{r Baseline, eval = TRUE, echo=TRUE}
+data$TL_injury <-  data$Inj_status == "Injury" & data$Days_off > 0
+data$TL_injury <- as.logical(data$TL_injury)
+
+table(data$TL_injury)
+any(is.na(data$TL_injury))
+```
+
+## Explanatory features 
+### Basic player information
+
+Please note: The plots serve primarily as plausibility check and therefor visualize the distribution on the level of datapoints (not players). 
+
+#### Age
+
+```{r Age, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=Age,y=3)) + geom_boxplot()+ ggtitle("Boxplot of age") + xlab("age [years]")+scale_x_continuous(expand = c(0,1))+
+  ggplot_theme+theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y =  element_blank(),
+    axis.title =   element_blank()
+                     )
+any(is.na(data$Age))
+```
+
+The age of players is consistent with professional soccer. There are no outliers and no missing values. 
+
+#### Playing position
+
+Labels: 0=Goalkeeper, 1=Defender, 2=Midfielder, 3=Striker
+Note: The counts are for the number of datapoints (not individual players). 
+
+```{r Playing position, eval=TRUE, echo=TRUE}
+data$Pos_code<-factor(data$Pos_code,levels = 0:3,labels = c("Goalkeeper","Defender","Midfielder","Striker"))
+
+table(data$Pos_code)
+any(is.na(data$Pos_code)) 
+```
+
+Plausible and without missing values
+
+#### History of previous injuries
+
+Here the current number of days lost due to injury is calculated from the baseline value (injuries prior to the study) and injuries during the study period but previous to the day in question.
+
+```{r Days lost to injury current, eval=TRUE, echo=TRUE}
+# Define funktion for trailing sum of "Unfit = 1"
+trailing_sum <- function(df){
+  df$trailing_sum_inj <- runner(x = as.vector(df$Unfit), f = function(x) sum(x, na.rm = TRUE), k = 365, lag = 1)
+  return(df)
+}
+
+
+#Split the dataset according to ID 
+data_split <- split(data, data$ID)
+
+# Apply the function
+data_split <- lapply(data_split, trailing_sum)
+
+# Unlist back to one dataframe  
+data <- ldply(data_split, data.frame)
+
+
+# Calculate current days lost to injury (trailing_sum plus baseline) 
+data$VV_days_c <- data$VV_days_BL + data$trailing_sum_inj
+
+s2 <- summarize(data, Injured_BL_mean = mean(VV_days_BL), Injured_BL_SD = sd(VV_days_BL), Injured_current_mean = mean(VV_days_c), Injured_current_SD = sd(VV_days_c))
+
+any_na <- any(is.na(data$VV_days_c))
+s4 <- cbind(s2, any_na)
+
+kable(s4, caption = "rmd-table 2: Days lost to injury - baseline vs. current", digits = 0, align = "c")
+
+```
+
+##### Adjusting days lost to injury for age 
+
+Higher age means more cumulative exposure that is more opportunity to get injured. By adjusting for age, the feature rather reflects individual susceptibility for injury. 
+
+```{r Days lost vs. Age, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=Age, y=VV_days_c)) + geom_point() + geom_smooth(method = "lm") + ggtitle("Association of days lost to injury with age") + ylab("Days lost to injury") + xlab("Age [years]")+ggplot_theme+scale_x_continuous(expand = c(0.01,0.01))+scale_y_continuous(expand = c(0.1,0.1))
+```
+
+
+```{r Adjusting days lost for age, eval=TRUE, echo=TRUE}
+model_age <- lm(VV_days_c ~ Age, data = data)
+summary(model_age)
+data$VV_resid_age <- resid(model_age)
+
+ggplot(data, aes(x=Age, y=VV_resid_age)) + 
+  geom_point() + geom_smooth(method = "lm") + 
+  ggtitle("Age adjusted days lost to injury vs. age") + 
+  ylab("Days lost to injury - age adjusted (lm residuals)") + 
+  xlab("Age [years]")+
+  ggplot_theme+
+  scale_x_continuous(expand = c(0.01,0.01))+
+  scale_y_continuous(expand = c(0.1,0.1))
+```
+```{r Distribution of age adjusted days lost to injury, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=VV_resid_age)) + geom_boxplot() + ggtitle("Boxplot of age-adjusted days lost to pre1vious injuries") + xlab("days lost to previous injury (adjusted) [ ]")+ggplot_theme+
+  scale_x_continuous(expand = c(0.1, 0.1))+
+  scale_y_continuous(expand = c(0.01,0.01))+
+  theme(
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank(),
+        )
+any(is.na(data$VV_resid_age))  
+```
+
+### Screening 
+#### Imputing missing values
+
+Some players have missed parts of one of the two screening tests. In this case the values from the other screening test are used to fill in the missing values.
+
+##### Checking for missing values in raw screening data
+
+```{r check screening data, eval=TRUE, echo=TRUE}
+na_Fat <- sum(is.na(data$Fat))
+na_IAT <- sum(is.na(data$IAT))
+na_Sprint <- sum(is.na(data$Sprint_30))
+na_SIMS_Score <- sum(is.na(data$SIMS_score))
+na_SIMS_Pain <- sum(is.na(data$SIMS_pain))
+
+na_Screening <- cbind(na_Fat, na_IAT, na_Sprint, na_SIMS_Score, na_SIMS_Pain)
+
+kable(na_Screening, caption = "Missing raw values in screening variables", digits = 0, align = "c")
+```
+##### Filling in values from the other test if available
+
+```{r filling up screening data, eval=TRUE, echo=TRUE}
+# For Fat
+data <- ddply(data, 
+      .(ID), 
+      transform, 
+      Fat=ifelse(is.na(Fat), median(Fat, na.rm=TRUE), Fat))
+
+
+# For IAT
+data <- ddply(data, 
+                  .(ID), 
+                  transform, 
+                  IAT=ifelse(is.na(IAT), median(IAT, na.rm=TRUE), IAT))
+
+# For Sprint_30
+
+data <- ddply(data, 
+                  .(ID), 
+                  transform, 
+                  Sprint_30=ifelse(is.na(Sprint_30), median(Sprint_30, na.rm=TRUE), Sprint_30))
+
+```
+
+##### Checking for remaining missing values
+
+```{r check screening for missing values, eval=TRUE, echo=TRUE}
+na_Fat <- sum(is.na(data$Fat))
+na_IAT <- sum(is.na(data$IAT))
+na_Sprint <- sum(is.na(data$Sprint_30))
+na_SIMS_Score <- sum(is.na(data$SIMS_score))
+na_SIMS_Pain <- sum(is.na(data$SIMS_pain))
+
+na_Screening <- cbind(na_Fat, na_IAT, na_Sprint, na_SIMS_Score, na_SIMS_Pain)
+
+kable(na_Screening, caption = "Missing values in screening variables after filling up values from other test", digits = 0, align = "c")
+
+
+```
+
+##### Removing players with remaining missing values 
+
+Three players who never provided data for at least one screening test are excluded. There remain 88 players.
+
+```{r Remove players without screening, eval=TRUE, echo=TRUE}
+length(unique(data$ID))
+
+data <- subset(data, !is.na(Fat))
+
+length(unique(data$ID))
+```
+
+##### Final check for completeness of screening data
+
+```{r Screening final check, eval=TRUE, echo=TRUE}
+na_Fat <- sum(is.na(data$Fat))
+na_IAT <- sum(is.na(data$IAT))
+na_Sprint <- sum(is.na(data$Sprint_30))
+na_SIMS_Score <- sum(is.na(data$SIMS_score))
+na_SIMS_Pain <- sum(is.na(data$SIMS_pain))
+
+na_Screening <- cbind(na_Fat, na_IAT, na_Sprint, na_SIMS_Score, na_SIMS_Pain)
+
+kable(na_Screening, caption = "Final check for completeness of screening data", digits = 0, align = "c")
+
+```
+#### Check distribution of screening features
+##### Body fat percentage
+
+```{r Fat, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=Fat)) + geom_boxplot() + ggtitle("Boxplot of measured body fat [%]") + xlab("Body fat [%]")+scale_x_continuous(expand = c(0,1))+
+  ggplot_theme+theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y =  element_blank(),
+    axis.title =   element_blank()
+                     )
+
+```
+
+##### Individual anaerobic threshold
+
+```{r IAT, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=IAT)) + geom_boxplot() + ggtitle("Boxplot of measured individual anaerobic threshold [km/h]") + xlab("IAT [km/h]")+scale_x_continuous(expand = c(0,1))+
+  ggplot_theme+theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y =  element_blank(),
+    axis.title =   element_blank()
+                     )
+```
+
+##### 30 m linear sprint time
+
+```{r Sprint_30, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=Sprint_30)) + geom_boxplot() + ggtitle("Boxplot of measured 30 m linear sprint time [s]") + xlab("30 m linear sprint time [s]")+scale_x_continuous(expand = c(0,0.25))+
+  ggplot_theme+theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y =  element_blank(),
+    axis.title =   element_blank()
+                     )
+```
+
+##### Soccer Injury Movement Screen - overall score
+
+```{r SIMS score, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=SIMS_score)) + geom_boxplot() + ggtitle("Boxplot of measured SIMS overall score []") + xlab("SIMS overall score")+scale_x_continuous(expand = c(0,1))+
+  ggplot_theme+theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y =  element_blank(),
+    axis.title =   element_blank()
+                     )
+```
+
+#### Soccer Injury Movement Screen - pain in at least one subtest
+
+SIMS_pain is the sum of pain scores in the SIMS subtests. Here we dichotomize into no pain vs. pain in at least one subtest.
+
+```{r}
+data$SIMS_pain <- data$SIMS_pain!="0"
+
+table(data$SIMS_pain)
+```
+
+
+### Monitoring
+#### Internal training load
+
+Three variables regarding internal training load (session RPE method) are taken from the custom App used for data collection.
+
+sRPE = internal training load for the respective day and player (can be sum of several training bouts). If the respective player failed to provide internal training load that day, the team average is already imputed. Of note: The "Source" variable allows tracking whether sRPE has been directly provided by the individual player. 
+
+sRPE_avg_7d = linearly weighted, trailing 7 day average of sRPE for the respective player. This variable is used as measure of current training load. 
+
+sRPE_team_avg = team average of sRPE values provided that day. This variable is used to gauge the strain imposed by the current day training (exposure). This variable is used as indicator of the stress imposed by the exposure on the day of prediction. 
+    
+##### Check for missing values
+
+There are no missing values.
+
+```{r Check training load for missing data, eval=TRUE, echo=TRUE}
+na_sRPE <- any(is.na(data$Srpe))
+na_avg_7d <- any(is.na(data$Srpe_avg_7d))
+na_avg_team <- any(is.na(data$Srpe_team_avg))
+
+na_Load <- cbind(na_sRPE, na_avg_7d, na_avg_team)
+
+kable(na_Load, caption = "Missing values for internal training load", digits = 0, align = "c")
+```
+##### Distribution of daily training loads
+
+```{r Distribution of training loads, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=Srpe, color=Club_code)) + geom_density() + ggtitle("Distribution of daily internal training load values by club") + xlab("sRPE [ ]")+scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))+
+  ggplot_theme+guides(color="none")
+```
+
+```{r Distribution of 7d average, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=Srpe_avg_7d, color=Club_code)) + geom_density() + ggtitle("Distribution of 7 day average for internal training load by club") + theme(legend.position = "none") + xlab("trailing 7 day average of sRPE [ ]")+scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))+
+  ggplot_theme+guides(color="none")
+```
+```{r}
+ggplot(data, aes(x=Srpe_team_avg, color=Club_code)) + geom_density() + ggtitle("Distribution of daily team average for internal training load by club") + theme(legend.position = "none") + xlab("team average of sRPE [ ]")+scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))+
+  ggplot_theme+guides(color="none")
+```
+
+##### Checking for interindividual variation in the distribution of Srpe
+
+```{r Ordering players by median Srpe, eval=TRUE, echo=TRUE}
+# ID ordered by individual median of Srpe
+data_Srpe <- ddply(data, .(ID), summarize,  Srpe_median=median(Srpe))
+data_Srpe <- arrange(data_Srpe, Srpe_median)
+data_Srpe <- rowid_to_column(data_Srpe)
+data_Srpe$ID_Srpe <- data_Srpe$rowid
+data_Srpe <- subset(data_Srpe, select = c(ID, ID_Srpe))
+data_Srpe$ID_Srpe <- as.factor(data_Srpe$ID_Srpe)
+
+data <- merge(data, data_Srpe)
+data$ID_Srpe <- as.factor(data$ID_Srpe)
+
+```
+
+```{r Visualize interindividual variation in Srpe, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=ID_Srpe, y=Srpe)) + geom_boxplot(outlier.shape = NA, coef = 0) + ggtitle("Interquartile range of sRPE per player (ordered by median)") + xlab("Players ordered by median Srpe") + ylab("Interquartile range for Srpe") +ggplot_theme+ theme(axis.ticks = element_blank(), axis.text.x = element_blank()) + coord_cartesian(ylim = c(0,900))+scale_x_discrete(expand = c(0,0))+scale_y_continuous(expand = c(0.01,0))
+```
+There is considerable interindividual variation in the distribution of Srpe (location as well as spread).
+
+##### Scaling the training load variables 
+
+Taking into account the distribution of raw values, interindividual variation (and aiming at methodological consistency) a robust scaling with median and interquartile range is applied on the individual level for all 3 training load variables.  
+
+```{r Scaling training load variables, eval=TRUE, echo=TRUE}
+# Define function for robust scaling with median and interquartile range
+Srpe_robust_fun <- function(df){
+  df$Srpe_robust <- ((df$Srpe - median(df$Srpe)) / IQR(df$Srpe)) 
+  return(df)
+}
+
+Srpe_7d_robust_fun <- function(df){
+  df$Srpe_7d_robust <- ((df$Srpe_avg_7d - median(df$Srpe_avg_7d)) / IQR(df$Srpe_avg_7d)) 
+  return(df)
+}
+
+Srpe_team_robust_fun <- function(df){
+  df$Srpe_team_robust <- ((df$Srpe_team_avg - median(df$Srpe_team_avg)) / IQR(df$Srpe_team_avg)) 
+  return(df)
+}
+
+# Split the dataset according to ID 
+data_split <- split(data, data$ID)
+
+#### Apply functions
+data_split <- lapply(data_split, Srpe_robust_fun)
+data_split <- lapply(data_split, Srpe_7d_robust_fun)
+data_split <- lapply(data_split, Srpe_team_robust_fun)
+
+
+#### Unlist back to one df and merge with data 
+data <- ldply(data_split, data.frame)
+```
+
+##### Check distribution of scaled variables
+
+```{r check Srpe_robust, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=Srpe_robust, color=Club_code)) + geom_density() + ggtitle("Distribution of scaled daily internal training load values by club") + theme(legend.position = "none") + xlab("scaled sRPE [ ]")+scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))+
+  ggplot_theme+guides(color="none")
+```
+
+```{r Check Srpe_7d_robust, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=Srpe_7d_robust, color=Club_code)) + geom_density() + ggtitle("Distribution of scaled 7 day average for internal training load by club") + theme(legend.position = "none") + xlab("scaled trailing 7 day average of sRPE [ ]")+scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))+
+  ggplot_theme+guides(color="none")
+
+```
+
+```{r}
+ggplot(data, aes(x=Srpe_team_robust, color=Club_code)) + geom_density() + ggtitle("Distribution of daily team average for internal training load by club") + theme(legend.position = "none") + xlab("scaled team average of sRPE [ ]")+scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))+
+  ggplot_theme+guides(color="none")
+```
+
+##### Final check for missing values in scaled training loads
+
+There are no missing values. 
+
+```{r Load, final check for missing values, eval=TRUE, echo=TRUE}
+na_sRPE <- any(is.na(data$Srpe_robust))
+na_avg_7d <- any(is.na(data$Srpe_7d_robust))
+na_avg_team <- any(is.na(data$Srpe_team_robust))
+
+na_Load <- cbind(na_sRPE, na_avg_7d, na_avg_team)
+
+kable(na_Load, caption = "Missing values for scaled internal training load", digits = 0, align = "c")
+```
+#### Subjective stress and recovery (questionair data)
+
+#### Selection of dimension and missing values
+
+From the 8 dimensions of the Short Recovery and Stress Scale only "Overall Stress" is used (due to the limited number of criterion injuries). Unfortunately, the number of missing data is considerable. 
+
+```{r Check KEB_AB for missing values}
+sum(is.na(data$KEB_AB))
+```
+
+##### First line imputation 
+
+Imputing team median for the respective day.
+
+```{r Imputing KEB 1/2, eval=TRUE, echo=TRUE}
+# Preserve raw value for later double-check
+data$KEB_AB_raw <- data$KEB_AB
+
+# Create variable differentiating original raw values and imputations
+data$Source_KEB <- is.na(data$KEB_AB_raw)
+
+# Impute team median for the same day
+data <- ddply(data, 
+                  .(Club_code, Date), 
+                  transform, 
+                  KEB_AB=ifelse(is.na(KEB_AB), median(KEB_AB, na.rm=TRUE), KEB_AB))
+
+sum(is.na(data$KEB_AB))
+
+```
+There remain a few missing values
+
+#### Second line imputation
+
+Team median of interpolation between the days before and after
+
+```{r Imputing KEB 2/2, eval=TRUE, echo=TRUE}
+# Funktions for previous and next day
+trailing_day <- function(df){
+  df$KEB_AB_prev <- runner(x = as.vector(df$KEB_AB), f = function(x) sum(x, na.rm = TRUE), k = 1, lag = 1)
+  return(df)
+}
+
+next_day <- function(df){
+  df$KEB_AB_next <- runner(x = as.vector(df$KEB_AB), f = function(x) sum(x, na.rm = TRUE), k = 1, lag = -1)
+  return(df)
+}
+
+# Split the dataset according to ID 
+data_split <- split(data, data$ID)
+
+# Apply functions
+data_split <- lapply(data_split, trailing_day)
+data_split <- lapply(data_split, next_day)
+
+
+# Unlist back to one df
+data <- ldply(data_split, data.frame)
+
+
+data$KEB_AB_prev <- unlist(data$KEB_AB_prev)
+data$KEB_AB_next <- unlist(data$KEB_AB_next)
+
+# Calculate mean of previous and next day
+data$KEB_AB_interpol <- (data$KEB_AB_prev + data$KEB_AB_next)/2
+data$KEB_AB_interpol <- round(data$KEB_AB_interpol)
+
+# Fill in team median of interpolated value for missing values
+data <- ddply(data, 
+                  .(Club_code, Date), 
+                  transform, 
+                  KEB_AB=ifelse(is.na(KEB_AB), median(KEB_AB_interpol, na.rm=TRUE), KEB_AB))
+
+# Check for remaining missing values
+any(is.na(data$KEB_AB))
+
+# Check for agreement with raw values
+data$check_KEB <- (data$KEB_AB_raw - data$KEB_AB)
+data$check_KEB <- as.numeric(data$check_KEB)
+count(data$check_KEB > 0)
+```
+Fine - All missing values have been filled in with the originally present raw values unchanged.
+
+##### Check for interindividual variability in the distribution of KEB_AB
+
+There is considerable interindividual variation in the distribution of KEB_AB (that is: differncees in the habitual use of the scale between players). 
+
+```{r Order players by median KEB_AB}
+# ID ordered by individual median of KEB_AB
+data_KEB <- ddply(data, .(ID), summarize,  KEB_median=median(KEB_AB))
+data_KEB <- arrange(data_KEB, KEB_median)
+data_KEB <- rowid_to_column(data_KEB)
+data_KEB$ID_KEB <- data_KEB$rowid
+data_KEB <- subset(data_KEB, select = c(ID, ID_KEB))
+
+data <- merge(data, data_KEB)
+data$ID_KEB <- as.factor(data$ID_KEB)
+
+```
+
+
+```{r Interindividual variation in distribution of KEB_AB, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=ID_KEB, y=KEB_AB)) + geom_boxplot(outlier.shape = NA, coef = 0) + ggtitle("Interquartile range of KEB_AB per player") + xlab("Players ordered by median KEB_AB") + ylab("Interquartile range for KEB_AB") +ggplot_theme+ theme(axis.ticks = element_blank(), axis.text.x = element_blank())+scale_x_discrete(expand = c(0,0))+scale_y_continuous(expand = c(0.02,0))
+  
+```
+
+There is marked interindividual variation in the distribution of KEB (location as well as spread).
+
+##### Robust scaling on the individual level
+
+Aiming at a feature for which a specific value means the same for all individuals, a robust scaling with median and interquartile range is applied on the individual level (same rationale and method as for Srpe). 
+
+Technical note: Some players have IQR = 1. Therefore, to avoid divisions by 0, a constant (1) is added to IQR. 
+
+Practical note: In reality, players who always provide the same value for KEB probably did not take the questionnaire seriously and it may be wiser to use a model without KEB for them. This remains to be tested in future work. 
+
+```{r Scaling KEB_AB, eval=TRUE, echo=TRUE}
+# Define function for robust scaling with median and interquartile range
+KEB_AB_robust_fun <- function(df){
+  df$KEB_AB_robust <- ((df$KEB_AB - median(df$KEB_AB)) / (IQR(df$KEB_AB)+1)) 
+  return(df)
+}
+
+
+# Split the dataset according to ID 
+data_split <- split(data, data$ID)
+
+#### Apply function
+data_split <- lapply(data_split, KEB_AB_robust_fun)
+
+#### Unlist back to one df and merge with data 
+data <- ldply(data_split, data.frame)
+```
+
+##### Check for missing values and distribution of scaled variables
+
+```{r Distribution of scaled KEB, eval=TRUE, echo=TRUE}
+any(is.na(data$KEB_AB_robust))
+ggplot(data, aes(x=KEB_AB_robust, color=Club_code)) + geom_density() + ggtitle("Distribution of scaled subjective recovery need (KEB_AB) by club") + theme(legend.position = "none") + xlab("scaled sRPE [ ]")+scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))+
+  ggplot_theme+guides(color="none")
+```
+
+```{r Interindividual variation of scaled KEB, eval=TRUE, echo=TRUE}
+ggplot(data, aes(x=ID_KEB, y=KEB_AB_robust)) + geom_boxplot(outlier.shape = NA, coef = 0) + ggtitle("Interquartile range of scaled KEB_AB per player") + xlab("Player ID") + ylab("Interquartile range for KEB_AB_robust")+ggplot_theme + theme(axis.ticks = element_blank(), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 5)) + coord_cartesian(ylim = c(-1, 1))+scale_x_discrete(expand = c(0,0))+scale_y_continuous(expand = c(0,0))+
+  guides(color="none")
+```
+
+### Additional feature: Time following return-to-play
+
+In addition to the a-priori specified set of features, the time frame (4 weeks) following return to play is identified. 
+
+Note: The reason for the "unfit" period is not considered (not restricted to the follow-up of criterion injuries)
+
+#### Calculate difference in Unfit status from the previous day
+
+```{r change in unfit, eval=TRUE, echo=TRUE}
+# Define function for Unfit status on the previous day
+trailing_day <- function(df){
+  df$Unfit_prev <- runner(x = as.vector(df$Unfit), f = function(x) sum(x, na.rm = TRUE), k = 1, lag = 1)
+  return(df)
+}
+
+order_date <- function(df){
+  df <- arrange(df, ID, Date)
+  return(df)
+}
+
+# Split the dataset according to ID 
+data_split <- split(data, data$ID)
+
+# Apply function
+data_split <- lapply(data_split, order_date)
+data_split <- lapply(data_split, trailing_day)
+
+# Unlist back to one df and adjust object type
+data <- ldply(data_split, data.frame)
+data$Unfit_prev <- as.logical(data$Unfit_prev)
+data$Unfit_change <- xor(data$Unfit,data$Unfit_prev)
+
+# Identify day of RTP (change from Unfit = 2 to Unfit = 1)
+data$RTP <- !data$Unfit & data$Unfit_prev
+
+table(data$RTP)
+```
+
+#### Identify timepoints within 4 weeks following return to play
+
+```{r Timeframe following RTP, eval=TRUE, echo=TRUE}
+
+# Define function for trailing sum of RTP over past 4 weeks
+trailing_RTP <- function(df){
+  df$After_RTP <- runner(x = as.vector(df$RTP), f = function(x) sum(x, na.rm = TRUE), k = 28, lag = 1)
+  return(df)
+}
+
+# Split the dataset according to ID 
+data_split <- split(data, data$ID)
+
+# Apply function
+data_split <- lapply(data_split, order_date)
+data_split <- lapply(data_split, trailing_RTP)
+
+
+# Unlist back to one df and set to logical
+data <- ldply(data_split, data.frame)
+
+data$After_RTP <- as.logical(data$After_RTP)
+
+table(data$After_RTP)
+```
+
+# Finalizing the curated dataset for the main analysis
+
+```{r Finalizing dataset for analysis, eval=TRUE, echo=TRUE}
+# Filter for relevant variables
+data_analyse <- data %>% select(ID, Date, Day_in_study, Club_code, Inj_status, Unfit, After_RTP, Crit, TL_injury, Age, Pos_code, VV_days_c, VV_resid_age, Fat, IAT, Sprint_30, SIMS_score, SIMS_pain, Srpe, Source, Srpe_avg_7d, Srpe_7d_robust, KEB_AB, KEB_AB_robust, Source_KEB, Matchday, Training_time, Srpe_team_avg, Srpe_team_robust, Days_off, Reason, Injury_mechanism, Injury_date, Return_date, Victim)
+
+save(data_analyse, file = "data_analyse.RData")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
