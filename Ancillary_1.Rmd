@@ -1,0 +1,818 @@
+---
+title: "Forecasting football injuries by combining screening, monitoring and machine learning - 1/4 Ancillary Data analysis"
+author: "Anne Hecksteden & Georges Pierre Schmartz"
+date: "04 May 2022"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: FALSE
+      smooth_scroll: FALSE
+    toc_depth: 5
+
+---
+
+```{r setup, echo=TRUE,message=FALSE,warning=FALSE}
+# clean workspace if needed
+rm(list = ls())
+source("utils.R")
+
+data<-get_main_data()
+data_test<-data$data_test
+data_training<-data$data_training
+training_IDs<-data$initial_training_IDs
+CV_folds<-data$CV_folds
+data <- data$full_dataset
+# Work with multiple threads (use all of the available ones)
+cl <- makePSOCKcluster(ceiling(detectCores()/4))
+registerDoParallel(cl)
+```
+# Ancilary analysis 1: Round-Robin 
+
+The whole model fitting and evaluation process is repeated three times to probe the robustness of results and get comparable (test set) predictions for all players (e.g. for visualizing the time-course of probability predictions).
+
+During the train-test split of each round, all players who were have previously been part of a test set are withheld and later added to the training set. The proportion of the split is adapted to get equal sized sets. Otherwise, the model fitting and evaluation process is the same as for the main analysis. 
+
+```{r Recover_results, eval=TRUE, echo=TRUE}
+# Preserve training and test set from first / main round 
+data_training_1 <- data_training
+data_test_1 <- data_test
+#Rebuild model 1
+trainctrl <- trainControl(method = "repeatedcv", number = length(training_IDs), repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE, index=CV_folds,sampling = rose_upsampling) 
+
+set.seed(42)
+gbm_tree_auto <- train(Crit ~ ., data = data_training, method = "gbm", metric = "ROC", trControl = trainctrl, verbose = FALSE, tuneGrid = gbmGrid) 
+
+# Apply to test set
+Predicted_1 <- predict(gbm_tree_auto, newdata=data_test)
+# View predictions for the test set
+Predicted_1b <- data.frame(Predicted_1)
+
+# Merge with testset
+data_test_plus <- cbind(data_test, Predicted_1b)
+data_test_plus$Predicted_1 <- factor(data_test_plus$Predicted_1, levels = c("No", "Yes"))
+
+# Get probabilities
+Predicted_1p <- predict(gbm_tree_auto, newdata=data_test, type = "prob")
+colnames(Predicted_1p) <- c("Prob_no", "prob_yes") 
+
+# Merge
+data_test_plus <- cbind(data_test_plus, Predicted_1p)
+data_test_plus$Predicted <- factor(data_test_plus$Predicted, levels = c("No", "Yes"))
+
+Predicted_train_1 <- predict(gbm_tree_auto, newdata=data_training)
+
+## View predictions for the training set
+Predicted_train_1b <- data.frame(Predicted_train_1)
+
+## Merge with trainingset
+data_train_plus <- cbind(data_training, Predicted_train_1b)
+data_train_plus$Predicted_train_1 <- factor(data_train_plus$Predicted_train_1, levels = c("No", "Yes"))
+
+## Get probabilities
+Predicted_train_1p <- predict(gbm_tree_auto, newdata=data_training, type = "prob")
+colnames(Predicted_train_1p) <- c("prob_no", "prob_yes") 
+
+## Merge
+data_train_plus <- cbind(data_train_plus, Predicted_train_1p)
+
+
+# Extract from fit object
+predicted <- as.data.frame(gbm_tree_auto$pred$pred)
+observed <- as.data.frame(gbm_tree_auto$pred$obs)
+prob_no <- as.data.frame(gbm_tree_auto$pred$No)
+prob_yes <- as.data.frame(gbm_tree_auto$pred$Yes)
+
+# Assemble and reformat cv results
+cv_roc <- cbind(predicted, observed, prob_no, prob_yes)
+names(cv_roc) <- c("pred", "obs", "prob_no", "prob_yes")
+cv_roc$obs_i <- cv_roc$obs == "Yes"
+
+```
+### Repeat split as round-robin 
+#### Get training and test sets 2/4
+ 
+```{r Split 2/4, eval=TRUE, echo=TRUE}
+
+
+# Before filtering
+data_x <- filter(data, ID %in% training_IDs) # original training set with full set of variables (including "Victim" to stratify the split)
+data_y <- filter(data, !(ID %in% training_IDs)) # first round test set with full set of variables
+
+# Get set of "unique" IDs never used for testing 
+data_unique_x <- distinct(data_x, ID, .keep_all = TRUE) 
+
+#Get IDs to split previous training set (never used for testing)
+tr_prop = 0.66    # proportion of first training set to use for new split (equals ~ 0.75 from original)
+
+training_set_2 = ddply(data_unique_x, .(Victim), function(., seed) { set.seed(seed); .[sample(1:nrow(.), trunc(nrow(.) * tr_prop)), ] }, seed = 5)
+
+training_IDs_2 <- as.vector(training_set_2$ID)
+
+# Use vector with training IDs to split data not previously used for testing
+data_training_x <- filter(data_x, ID %in% training_IDs_2) # data / players never used for testing (including round 2)
+data_test_2 <- filter(data_x, !(ID%in% training_IDs_2))
+
+# Ad previous round test set to current training set
+data_training_2 <- rbind(data_y, data_training_x)
+
+```
+
+#### Get training and test sets 3/4
+ 
+```{r Split 3/4, eval=TRUE, echo=TRUE}
+
+# Before filtering
+data_x <- data_training_x # data not previously used for testing is data_training_x 
+data_y <- rbind(data_test_1, data_test_2) # data previously used for testing
+
+# Get set of "unique" IDs never used for testing 
+data_unique_x <- distinct(data_x, ID, .keep_all = TRUE) 
+
+#Get IDs to split previous training set ("never used for testing)
+tr_prop = 0.5    # proportion to use for new split (equals ~ 0.75 from original)
+
+training_set_3 = ddply(data_unique_x, .(Victim), function(., seed) { set.seed(seed); .[sample(1:nrow(.), trunc(nrow(.) * tr_prop)), ] }, seed = 5)
+
+training_IDs_3 <- as.vector(training_set_3$ID)
+
+# Use vector with training IDs to split data not previously used for testing
+data_training_x <- filter(data_x, ID %in% training_IDs_3) # data / players never used for testing
+data_test_3 <- filter(data_x, !(ID%in% training_IDs_3))
+
+# Ad previous test sets to current training set
+data_training_3 <- rbind(data_y, data_training_x)
+
+```
+
+#### Get training and test sets 4/4
+ 
+```{r Split 4/4, eval=TRUE, echo=TRUE}
+
+# data not previously used for testing is data_training_x 
+data_y <- rbind(data_test_1, data_test_2, data_test_3) # data previously used for testing
+
+# rename (no further split required)
+data_training_4 <- data_y
+data_test_4 <- data_training_x #last quarter never used for testing before
+
+```
+
+#### Check
+
+```{r Check 2/4, eval=TRUE, echo=TRUE}
+
+table(data_training_2$Victim)
+table(data_test_2$Victim)
+table(data_training_2$Crit)
+```
+
+```{r Check 3/4, eval=TRUE, echo=TRUE}
+
+table(data_training_3$Victim)
+table(data_test_3$Victim)
+table(data_training_3$Crit)
+```
+
+```{r Check 4/4, eval=TRUE, echo=TRUE}
+
+table(data_training_4$Victim)
+table(data_test_4$Victim)
+table(data_training_4$Crit)
+```
+
+#### Subset secondary training sets 
+
+```{r Subset round-robin, eval=TRUE, echo=TRUE}
+
+data_training_2 <- subset(data_training_2, select = c("ID",colnames(data_training)))
+data_training_3 <- subset(data_training_3, select = colnames(data_training_2))
+data_training_4 <- subset(data_training_4, select = colnames(data_training_2))
+
+# Generate cross-validation folds index and remove ID
+data_player_in_training_2<-length(unique(data_training_2$ID))
+CV_folds_2<-groupKFold(data_training_2$ID, k = length(unique(data_training_2$ID))) 
+data_training_2<-select(data_training_2, !ID)
+data_player_in_training_3<-length(unique(data_training_3$ID))
+CV_folds_3<-groupKFold(data_training_3$ID, k = length(unique(data_training_3$ID))) 
+data_training_3<-select(data_training_3, !ID)
+data_player_in_training_4<-length(unique(data_training_4$ID))
+CV_folds_4<-groupKFold(data_training_4$ID, k = length(unique(data_training_4$ID)))
+data_training_4<-select(data_training_4, !ID)
+```
+
+### Fit gradient boosted models for secondary training sets
+
+#### Fit gradient boosted model 2/4 
+
+```{r Model fitting 2/4, eval=TRUE, echo=TRUE}
+
+# Set cross-validation parameters
+trainctrl_2 <- trainControl(method = "repeatedcv", number = data_player_in_training_2, repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE, index = CV_folds_2,sampling = rose_upsampling)
+
+# Train the model
+set.seed(42)
+gbm_tree_auto_2 <- train(Crit ~ ., data = data_training_2, method = "gbm", metric = "ROC", trControl = trainctrl_2, verbose = FALSE, tuneGrid = gbmGrid)
+
+# Show model
+gbm_tree_auto_2
+```
+
+#### Fit gradient boosted model 3/4
+
+```{r Model fitting 3/4, eval=TRUE, echo=TRUE}
+
+# Set cross-validation parameters
+trainctrl_3 <- trainControl(method = "repeatedcv", number = data_player_in_training_3, repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE, index = CV_folds_3,sampling = rose_upsampling)
+
+# Train the model
+set.seed(42)
+gbm_tree_auto_3 <- train(Crit ~ ., data = data_training_3, method = "gbm", metric = "ROC", trControl = trainctrl_3, verbose = FALSE, tuneGrid = gbmGrid)
+
+# Show model
+gbm_tree_auto_3
+```
+
+#### Fit gradient boosted model 4/4
+
+```{r Model fitting 4/4, eval=TRUE, echo=TRUE}
+
+# Set cross-validation parameters
+trainctrl_4 <- trainControl(method = "repeatedcv", number = data_player_in_training_4, repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE, index = CV_folds_4,sampling = rose_upsampling)
+
+# Train the model
+set.seed(42)
+gbm_tree_auto_4 <- train(Crit ~ ., data = data_training_4, method = "gbm", metric = "ROC", trControl = trainctrl_4, verbose = FALSE, tuneGrid = gbmGrid)
+
+# Show model
+gbm_tree_auto_4
+```
+
+### Cross-validation results of secondary models
+
+#### Cross-validation results 2/4
+
+```{r ROC curve CV 2/4, eval=TRUE, echo=TRUE}
+
+# Confusion matrix
+confusionMatrix(
+  gbm_tree_auto_2,
+  norm = "overall",
+  dnn = c("Prediction", "Crit")
+)
+
+# Extract from fit object
+predicted <- as.data.frame(gbm_tree_auto_2$pred$pred)
+observed <- as.data.frame(gbm_tree_auto_2$pred$obs)
+prob_no <- as.data.frame(gbm_tree_auto_2$pred$No)
+prob_yes <- as.data.frame(gbm_tree_auto_2$pred$Yes)
+
+cv_roc_2 <- cbind(predicted, observed, prob_no, prob_yes)
+names(cv_roc_2) <- c("pred", "obs", "prob_no", "prob_yes")
+
+cv_roc_2$obs_i <- cv_roc_2$obs == "Yes"
+
+temporary<-generate_rocs(cv_roc_2)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+#### Brier score
+```{r Brier score 2/4 cv, eval=TRUE, echo=TRUE}
+temporary<-compute_brier(cv_roc_2)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+```
+
+#### Cross-validation results 3/4
+
+```{r CV 3/4, eval=TRUE, echo=TRUE}
+
+# Confusion matrix
+confusionMatrix(
+  gbm_tree_auto_3,
+  norm = "overall",
+  dnn = c("Prediction", "Crit")
+)
+
+# Extract from fit object
+predicted <- as.data.frame(gbm_tree_auto_3$pred$pred)
+observed <- as.data.frame(gbm_tree_auto_3$pred$obs)
+prob_no <- as.data.frame(gbm_tree_auto_3$pred$No)
+prob_yes <- as.data.frame(gbm_tree_auto_3$pred$Yes)
+
+cv_roc_3 <- cbind(predicted, observed, prob_no, prob_yes)
+names(cv_roc_3) <- c("pred", "obs", "prob_no", "prob_yes")
+
+cv_roc_3$obs_i <-   cv_roc_3$obs == "Yes"
+
+
+# ROC curve with confidence interval
+temporary<-generate_rocs(cv_roc_3)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+#### Brier score
+```{r Brier score 3/4 cv, eval=TRUE, echo=TRUE}
+temporary<-compute_brier(cv_roc_3)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+```
+
+#### Cross-validation results 4/4
+
+```{r CV 4/4, eval=TRUE, echo=TRUE}
+
+# Confusion matrix
+confusionMatrix(
+  gbm_tree_auto_4,
+  norm = "overall",
+  dnn = c("Prediction", "Crit")
+)
+
+# Extract from fit object
+predicted <- as.data.frame(gbm_tree_auto_4$pred$pred)
+observed <- as.data.frame(gbm_tree_auto_4$pred$obs)
+prob_no <- as.data.frame(gbm_tree_auto_4$pred$No)
+prob_yes <- as.data.frame(gbm_tree_auto_4$pred$Yes)
+
+cv_roc_4 <- cbind(predicted, observed, prob_no, prob_yes)
+names(cv_roc_4) <- c("pred", "obs", "prob_no", "prob_yes")
+
+cv_roc_4$obs_i <-  cv_roc_4$obs == "Yes"
+
+temporary<-generate_rocs(cv_roc_4)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+#### Brier score
+```{r Brier score 4/4 cv, eval=TRUE, echo=TRUE}
+temporary<-compute_brier(cv_roc_4)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+```
+
+### Test set performance of secondary models
+
+#### Apply trained model to testset 2/4
+
+```{r Test predictions 2/4, eval=TRUE, echo=TRUE}
+
+# Apply to test set
+Predicted_2 <- predict(gbm_tree_auto_2, newdata=data_test_2)
+
+# View predictions for the test set
+Predicted_2b <- data.frame(Predicted_2)
+
+# Merge with testset
+data_test_plus_2 <- cbind(data_test_2, Predicted_2b)
+
+# Check confusion matrix
+table(data_test_plus_2$Crit, data_test_plus_2$Predicted_2)
+
+## Get probabilities
+Predicted_2p <- predict(gbm_tree_auto_2, newdata=data_test_2, type = "prob")
+colnames(Predicted_2p) <- c("rob_no", "prob_yes") 
+
+# Merge
+data_test_plus_2 <- cbind(data_test_plus_2, Predicted_2p)
+data_test_plus_2$Predicted <- factor(data_test_plus_2$Predicted_2, levels = c("No", "Yes"))
+
+# Plot
+ggplot(data_test_plus_2, aes(x=Crit, y=prob_yes, color = Crit))+ geom_jitter(alpha=0.1,size=0.6,shape=16)+ geom_boxplot(outlier.shape = NA,fill=NA)   +guides(color="none")+ggplot_theme+scale_y_continuous(expand=c(0,0),limits = c(0,1))  + ggtitle("Probability preditions for the test set")
+
+ggplot(data_test_plus_2, aes(x=Day_in_study, y=prob_yes) )+ geom_line() +facet_wrap(~ID,ncol = 3) +scale_y_continuous(limits = c(0,1),breaks = c(0,0.5,1))+ggplot_theme+theme(strip.background = element_blank(),strip.text = element_text(size=6),panel.spacing = unit(0, "lines"))+scale_x_continuous(expand=c(0,0))
+
+
+```
+
+##### Get testset performance 2/4
+
+##### ROC curve
+```{r ROC curve 2 test, eval=TRUE, echo=TRUE}
+temporary<-generate_rocs(data_test_plus_2)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+##### Brier score
+```{r Test 2 Brier, eval=TRUE, echo=TRUE}
+
+data_test_plus_2$CritL <- data_test_plus_2$Crit == "Yes"
+data_test_plus_2$CritL <- as.numeric(data_test_plus_2$CritL)
+
+temporary<-compute_brier(data_test_plus_2)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+
+```
+
+##### Get feature importance 2/4
+
+```{r Feature importance 2/4, eval=TRUE, echo=TRUE}
+
+plot_varimp(gbm_tree_auto_2)
+```
+
+
+#### Apply trained model to testset 3/4
+
+```{r Test predictions 3/4, eval=TRUE, echo=TRUE}
+
+# Apply to test set
+Predicted_3 <- predict(gbm_tree_auto_3, newdata=data_test_3)
+
+# View predictions for the test set
+Predicted_3b <- data.frame(Predicted_3)
+
+# Merge with testset
+data_test_plus_3 <- cbind(data_test_3, Predicted_3b)
+
+# Check confusion matrix
+table(data_test_plus_3$Crit, data_test_plus_3$Predicted_3)
+
+## Get probabilities
+Predicted_3p <- predict(gbm_tree_auto_3, newdata=data_test_3, type = "prob")
+colnames(Predicted_3p) <- c("rob_no", "prob_yes") 
+
+# Merge
+data_test_plus_3 <- cbind(data_test_plus_3, Predicted_3p)
+data_test_plus_3$Predicted <- factor(data_test_plus_3$Predicted_3, levels = c("No", "Yes"))
+
+# Plot
+ggplot(data_test_plus_3, aes(x=Crit, y=prob_yes, color = Crit))+ geom_jitter(alpha=0.1,size=0.6,shape=16)+ geom_boxplot(outlier.shape = NA,fill=NA)   +guides(color="none")+ggplot_theme+scale_y_continuous(expand=c(0,0),limits = c(0,1))  + ggtitle("Probs. for test set")
+
+ggplot(data_test_plus_3, aes(x=Day_in_study, y=prob_yes) ) + geom_line() +facet_wrap(~ID,ncol = 3) +scale_y_continuous(limits = c(0,1),breaks = c(0,0.5,1))+ggplot_theme+theme(strip.background = element_blank(),strip.text = element_text(size=6),panel.spacing = unit(0, "lines"))+scale_x_continuous(expand=c(0,0))
+
+
+```
+
+##### Get testset performance 3/4
+
+```{r ROC curve 3 test, eval=TRUE, echo=TRUE}
+temporary<-generate_rocs(data_test_plus_3)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+##### Brier score
+```{r Test 3 Brier, eval=TRUE, echo=TRUE}
+
+data_test_plus_3$CritL <- data_test_plus_3$Crit == "Yes"
+data_test_plus_3$CritL <- as.numeric(data_test_plus_3$CritL)
+
+temporary<-compute_brier(data_test_plus_3)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+```
+
+##### Feature importance 3/4
+
+```{r Feature importance 3/4, eval=TRUE, echo=TRUE}
+
+plot(varImp(gbm_tree_auto_3))
+```
+
+#### Apply trained model to testset 4/4
+
+```{r Test predictions 4/4, eval=TRUE, echo=TRUE}
+
+# Apply to test set
+Predicted_4 <- predict(gbm_tree_auto_4, newdata=data_test_4)
+
+# View predictions for the test set
+Predicted_4b <- data.frame(Predicted_4)
+
+# Merge with testset
+data_test_plus_4 <- cbind(data_test_4, Predicted_4b)
+
+# Check confusion matrix
+table(data_test_plus_4$Crit, data_test_plus_4$Predicted_4)
+
+
+## Get probabilities
+
+Predicted_4p <- predict(gbm_tree_auto_4, newdata=data_test_4, type = "prob")
+colnames(Predicted_4p) <- c("rob_no", "prob_yes") 
+
+# Merge
+data_test_plus_4 <- cbind(data_test_plus_4, Predicted_4p)
+data_test_plus_4$Predicted <- factor(data_test_plus_4$Predicted_4, levels = c("No", "Yes"))
+
+# Plot
+ggplot(data_test_plus_4, aes(x=Crit, y=prob_yes, color = Crit))+ geom_jitter(alpha=0.1,size=0.6,shape=16)+ geom_boxplot(outlier.shape = NA,fill=NA)   +guides(color="none")+ggplot_theme+scale_y_continuous(expand=c(0,0),limits = c(0,1))  + ggtitle("Probs. for test set")
+
+ggplot(data_test_plus_4, aes(x=Day_in_study, y=prob_yes) )+ geom_line() +facet_wrap(~ID,ncol = 3) +scale_y_continuous(limits = c(0,1),breaks = c(0,0.5,1))+ggplot_theme+theme(strip.background = element_blank(),strip.text = element_text(size=6),panel.spacing = unit(0, "lines"))+scale_x_continuous(expand=c(0,0))
+
+```
+
+##### Get testset performance 4/4
+
+```{r ROC curve 4 test, eval=TRUE, echo=TRUE}
+temporary<-generate_rocs(data_test_plus_4)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+##### Brier score
+```{r Test 4 Brier, eval=TRUE, echo=TRUE}
+
+data_test_plus_4$CritL <- data_test_plus_4$Crit == "Yes"
+data_test_plus_4$CritL <- as.numeric(data_test_plus_4$CritL)
+
+temporary<-compute_brier(data_test_plus_4)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+```
+
+##### Feature importance 4/4
+
+```{r Feature importance 4/4, eval=TRUE, echo=TRUE}
+
+plot_varimp(gbm_tree_auto_4)
+```
+
+
+### Summary of round-robin results
+
+#### Timecourse of probability predictions
+
+```{r Timecourse, eval=TRUE, echo=TRUE, warning=FALSE}
+# Assign variable for run
+data_test_plus$Run <- 1
+data_test_plus_2$Run <- 2
+data_test_plus_3$Run <- 3
+data_test_plus_4$Run <- 4
+
+# Merge
+common <- colnames(data_test_plus)[colnames(data_test_plus)%in%colnames(data_test_plus_2)]
+data_test_plus_all <- rbind(data_test_plus[,common], data_test_plus_2[,common], data_test_plus_3[,common], data_test_plus_4[,common])
+
+# Adjust type for "Run"
+data_test_plus_all$Run <- as.factor(data_test_plus_all$Run)
+
+# Iday
+data_test_plus_all$Iday <- case_when(
+  data_test_plus_all$Crit == "Yes" ~ data_test_plus_all$Day_in_study
+    )
+
+data_test_plus_all$Iday <- as.integer(data_test_plus_all$Iday)
+
+data_test_plus_all_grouped <- group_by(data_test_plus_all, ID)
+
+# Plot
+ggplot(data_test_plus_all, aes(x=Day_in_study, y=prob_yes) ) + 
+  geom_line() + 
+  facet_wrap(~ID) +  
+  geom_vline(data = data_test_plus_all_grouped, aes(xintercept = Iday, color = "red")) + 
+  ggplot_theme+
+  theme(axis.text.x=element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.position = "none", 
+        strip.text.x = element_blank(), 
+        strip.background = element_blank(),
+        panel.spacing = unit(0, "lines")
+        ) + 
+  labs(title = "Time-course of predicted injury risk per player", subtitle = "Red lines denote timepoint of criterion injuries" )+  
+  scale_y_continuous(limits = c(0,1),breaks = c(0,0.5,1))+scale_x_continuous(expand=c(0,0))
+
+```
+
+##### Performance with pooled test set predicitons
+##### ROC curve
+
+```{r ROC curve test round robin, eval=TRUE, echo=TRUE}
+temporary<-generate_rocs(data_test_plus_all)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+##### Brier score
+```{r Test round robin Brier, eval=TRUE, echo=TRUE}
+
+data_test_plus_all$CritL <- data_test_plus_all$Crit == "Yes"
+data_test_plus_all$CritL <- as.numeric(data_test_plus_all$CritL)
+
+temporary<-compute_brier(data_test_plus_all)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+
+```
+
+```{r Pooled test violin-plot, eval=TRUE, echo=TRUE}
+
+# Plot
+ggplot(data_test_plus_all, aes(x=Crit, y=prob_yes, color = Crit)) + geom_violin(fill=NA, draw_quantiles = c(0.25, 0.5, 0.75))  + ggtitle("Pooled test set results from round-robin") + xlab("Day of criterion injury") + ylab("Predicted injury probability")  +ggplot_theme+ theme(legend.position ="none") +scale_y_continuous(limits = c(0,1),expand = c(0,0))
+```
+
+# Performance - the practical perspective
+
+## Proportion needed to prevent - Predictions based on cross-validated model from full dataset
+
+```{r Proportions full, eval=TRUE, echo=TRUE}
+
+# Make predictions with initial (not upsampled) training set
+Predicted_full <- predict(gbm_tree_auto, newdata=data)
+
+## View predictions 
+Predicted_fullb <- data.frame(Predicted_full)
+
+## Merge with training set
+data_full_plus <- cbind(data, Predicted_fullb)
+data_full_plus$Predicted_full <- factor(data_full_plus$Predicted_full, levels = c("No", "Yes"))
+
+## Get probabilities
+Predicted_fullp <- predict(gbm_tree_auto, newdata=data, type = "prob")
+colnames(Predicted_fullp) <- c("rob_no", "prob_yes") 
+
+## Merge
+data_full_plus <- cbind(data_full_plus, Predicted_fullp)
+data_full_plus$CritL <- data_full_plus$Crit == "Yes"
+data_full_plus$CritL <- as.numeric(data_full_plus$CritL)
+
+# Datapoints ordered by prob_yes
+data_full_plus_plot <- arrange(data_full_plus, desc(prob_yes))
+data_full_plus_plot$dp_ordered = rownames(data_full_plus_plot)
+data_full_plus_plot$dp_rel <- as.numeric(data_full_plus_plot$dp_ordered)/max(as.numeric(data_full_plus_plot$dp_ordered))
+data_full_plus_plot$ntile <- percent_rank(data_full_plus_plot$prob_yes)
+data_full_plus_plot$ntile <- 100-(data_full_plus_plot$ntile*100)
+data_full_plus_plot$cumsum <- cumsum(data_full_plus_plot$CritL)
+data_full_plus_plot$captured <- (data_full_plus_plot$cumsum/51)*100
+
+# Plot
+ggplot(data_full_plus_plot, aes(x=as.numeric(ntile), y=as.numeric(captured))) + geom_line() +ggplot_theme+ xlab("Percent of timepoints (in descending order of predicted injury probability)") + ylab("Percent of criterion injuries identified") + labs(title = "Final model applied to full dataset") +scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))
+
+```
+
+
+## "Proportion needed to prevent" in pooled test sets
+
+```{r Proportions pooled test, eval=TRUE, echo=TRUE}
+
+# Datapoints ordered by prob_yes
+data_test_plus_plot <- arrange(data_test_plus_all, desc(prob_yes))
+data_test_plus_plot$dp_ordered = rownames(data_test_plus_plot)
+data_test_plus_plot$dp_rel <- as.numeric(data_test_plus_plot$dp_ordered)/max(as.numeric(data_test_plus_plot$dp_ordered))
+data_test_plus_plot$ntile <- percent_rank(data_test_plus_plot$prob_yes)
+data_test_plus_plot$ntile <- 100-(data_test_plus_plot$ntile*100)
+data_test_plus_plot$cumsum <- cumsum(data_test_plus_plot$CritL)
+data_test_plus_plot$captured <- (data_test_plus_plot$cumsum/51)*100
+
+# Plot
+ggplot(data_test_plus_plot, aes(x=as.numeric(ntile), y=as.numeric(captured))) + geom_line() +ggplot_theme+ xlab("Percent of timepoints (in descending order of predicted injury probability)") + ylab("Percent of criterion injuries identified") + labs(title = "Pooled test-set results from round-robin") +scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))
+#End Parallel Computation
+stopCluster(cl)
+registerDoSEQ()
+```
+
+# Paper plots
+
+```{r Manuscript plots, eval=TRUE, echo=TRUE}
+
+
+#Figure 2
+combined_predictions<-rbind.data.frame(cbind.data.frame(prob_yes=cv_roc$prob_yes,Crit=cv_roc$obs,Experiment="a - Round 1: Cross-validation"),
+cbind.data.frame(prob_yes=data_test_plus$prob_yes,Crit=data_test_plus$Crit,Experiment="b - Round 1: Test set"),
+cbind.data.frame(prob_yes=data_test_plus_all$prob_yes,Crit=data_test_plus_all$Crit,Experiment="d - Combined test sets from round robin"),
+cbind.data.frame(prob_yes=data_train_plus$prob_yes,Crit=data_train_plus$Crit,Experiment="c - Round 1: Training set"))
+combined_predictions$Experiment<-factor(combined_predictions$Experiment,levels=unique(combined_predictions$Experiment),ordered = T)
+
+
+
+temporary_plot<-ggplot(combined_predictions,aes(d=Crit=="Yes",m=prob_yes))+geom_roc(labels=F,n.cuts = 0)+geom_abline(slope=1,color="blue",alpha=0.2,linetype = "dashed")+ facet_wrap(~Experiment)+ggplot_theme+xlab("False positive fraction (%)")+ylab("True positive fraction (%)")+scale_x_continuous(limits = c(0,1),expand = c(0,0),labels = c("0","25","50","75","100") )+scale_y_continuous(limits = c(0,1),expand = c(0,0),labels = c("0","25","50","75","100"))+theme( strip.background = element_blank(),panel.spacing.x=unit(1, "lines") , plot.margin = margin(t = 0, r = 0.8, b = 0, l = 0, unit = "lines"))
+
+aucs<-calc_auc(temporary_plot)
+aucs$AUC_text<-paste("AUC ≈",round(aucs$AUC,2))
+aucs$y<-0.2
+aucs$x<-0.8
+aucs$Experiment<-levels(combined_predictions$Experiment)
+temporary_plot+geom_text(inherit.aes = F, data = aucs, mapping = aes(x = x,y=y,label=AUC_text))
+
+#Figure 3
+ggplot(combined_predictions, aes(x=Crit, y=prob_yes, color = Crit)) + geom_violin(fill=NA, draw_quantiles = c(0.25, 0.5, 0.75))  + facet_wrap(~Experiment)+ xlab("Day of criterion injury") + ylab("Predicted injury probability")  +ggplot_theme+  scale_y_continuous(limits = c(0,1),expand = c(0,0))+theme( strip.background = element_blank())+guides(color="none") +scale_color_manual(values=c("No"="#4FD3D6","Yes"="#F8786F"))
+
+#Figure 4
+combined_practice<-rbind.data.frame(data_full_plus_plot%>%select(ntile,captured)%>%cbind.data.frame(Experiment="Final model applied to full dataset"),data_test_plus_plot%>%select(ntile,captured)%>%cbind.data.frame(Experiment="Pooled test-set results from round-robin"))
+ggplot(combined_practice, aes(x=as.numeric(ntile), y=as.numeric(captured))) + geom_line() +ggplot_theme+ xlab("Percent of timepoints (in descending order of predicted injury probability)") + ylab("Percent of criterion injuries identified") + scale_x_continuous(expand = c(0,0))+scale_y_continuous(expand = c(0,0))+facet_wrap(~Experiment)+theme( strip.background = element_blank(),panel.spacing.x=unit(1, "lines"), plot.margin = margin(t = 0, r = 1, b = 0, l = 0, unit = "lines"))
+
+#Figure 5
+ggplot(data_test_plus_all, aes(x=Day_in_study, y=prob_yes) ) + 
+  geom_line(size=0.2) + 
+  facet_wrap(~ID,ncol = 11) +  
+  geom_vline(data = data_test_plus_all_grouped, aes(xintercept = Iday, color = "red")) + 
+  ggplot_theme+
+  theme(axis.text.x=element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.position = "none", 
+        strip.text.x = element_blank(), 
+        strip.background = element_blank(),
+        panel.spacing =  unit(0, "lines")
+        ) + 
+  labs(title = "Time-course of predicted injury risk per player", subtitle = "Red lines denote timepoint of criterion injuries" )+  
+  scale_y_continuous(limits = c(0,1),breaks = c(0,1),expand=c(0,0),labels = c("0\n","\n1"))+
+  scale_x_continuous(expand=c(0,0))+
+  xlab("Day in study")+
+  ylab("Predicted injury probability")
+
+# Figure 6
+variable_importance_df<-varImp(gbm_tree_auto)$importance%>%rownames_to_column("Feature")%>%dplyr::rename(Round1=Overall)
+variable_importance_df<-varImp(gbm_tree_auto_2)$importance%>%rownames_to_column("Feature")%>%dplyr::rename(Round2=Overall)%>%full_join(variable_importance_df,by = "Feature")
+variable_importance_df<-varImp(gbm_tree_auto_3)$importance%>%rownames_to_column("Feature")%>%dplyr::rename(Round3=Overall)%>%full_join(variable_importance_df,by = "Feature")
+variable_importance_df<-varImp(gbm_tree_auto_4)$importance%>%rownames_to_column("Feature")%>%dplyr::rename(Round4=Overall)%>%full_join(variable_importance_df,by = "Feature")
+variable_ordering<-variable_importance_df%>%column_to_rownames("Feature")%>%apply(1,FUN=median)%>%sort()%>%names()
+variable_importance_df<-variable_importance_df%>%pivot_longer(!Feature,values_to = "Importance",names_to = "Round")%>%mutate(Round=gsub(Round,pattern = "Round",replacement = ""))
+variable_importance_df$Feature<-factor(variable_importance_df$Feature,levels = variable_ordering)
+line_df<-variable_importance_df%>%group_by(Feature)%>%dplyr::summarise(mini=min(Importance,na.rm = T),maxi=max(Importance,na.rm = T))%>%data.frame()
+ggplot(variable_importance_df,aes(x=Importance,y=Feature))+geom_segment(inherit.aes = F,data = line_df,aes(x = mini,xend=maxi, y =Feature,yend=Feature ),color="black")+geom_point( aes(color=Round),alpha=0.8,size=2)+scale_x_continuous(expand = c(0,0))+ggplot_theme
+
+#Suppl 1
+Player_predictions_huge<-ggplot(data_test_plus_all, aes(x=Day_in_study, y=prob_yes) ) + 
+  geom_line() + 
+  facet_wrap(~ID,ncol = 4) +  
+  geom_vline(data = data_test_plus_all_grouped, aes(xintercept = Iday, color = "red")) + 
+  ggplot_theme+
+  theme(axis.text.x=element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.position = "none", 
+        strip.background = element_blank(),
+        panel.spacing = unit(0, "lines"),
+        strip.text=element_text(size = 5)
+        ) + 
+  labs(title = "Time-course of predicted injury risk per player", subtitle = "Red lines denote timepoint of criterion injuries" )+  
+  scale_y_continuous(limits = c(0,1),breaks = c(0,1),expand = c(0,0))+scale_x_continuous(expand=c(0,0))+
+  xlab("Day in study")+
+  ylab("Predicted injury probability")
+#ggsave(plot = Player_predictions_huge,width = 210,height = 297,units = "mm",device = "svg",filename = "Player_predictions_huge.svg")
+```

@@ -1,0 +1,95 @@
+---
+title: "Forecasting football injuries by combining screening, monitoring and machine learning - 4/4 Ancillary Data analysis"
+author: "Anne Hecksteden & Georges Pierre Schmartz"
+date: "04 May 2022"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: FALSE
+      smooth_scroll: FALSE
+    toc_depth: 5
+
+---
+
+```{r setup, echo=TRUE,message=FALSE,warning=FALSE}
+# clean workspace if needed
+rm(list = ls())
+source("utils.R")
+data<-get_main_data()
+  
+data_test<-data$data_test
+data_training<-data$data_training
+
+# Work with multiple threads (use all of the available ones)
+cl <- makePSOCKcluster(ceiling(detectCores()/2))
+registerDoParallel(cl)
+```
+
+# Ancillary analysis 4: Competitor Models
+
+```{r Model comparison model generation, eval=TRUE, echo=TRUE}
+
+
+trainctrl_rose <- trainControl(method = "repeatedcv", number = data$player_in_training, repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE, index=data$CV_folds,sampling = rose_upsampling) 
+trainctrl_nr <- trainControl(method = "repeatedcv", number = data$player_in_training, repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE, index=data$CV_folds) 
+# GBM
+set.seed(42)
+gbm_tree_auto_rose <- train(Crit ~ ., data = data_training, method = "gbm", metric = "ROC", trControl = trainctrl_rose, verbose = FALSE, tuneGrid = gbmGrid)
+gbm_tree_auto_nr <- train(Crit ~ ., data = data_training, method = "gbm", metric = "ROC", trControl = trainctrl_nr, verbose = FALSE, tuneGrid = gbmGrid)
+# Decision Tree
+DT_model_rose <- train(Crit ~ ., data = data_training, method = "rpart", metric = "ROC", trControl = trainctrl_rose)
+DT_model_nr <- train(Crit ~ ., data = data_training, method = "rpart", metric = "ROC", trControl = trainctrl_nr) 
+# Random Forest
+RF_model_rose <- train(Crit ~ ., data = data_training, method = "rf", metric = "ROC", trControl = trainctrl_rose)
+RF_model_nr <- train(Crit ~ ., data = data_training, method = "rf", metric = "ROC", trControl = trainctrl_nr)
+# Logistic Regression
+LR_model_rose <- train(Crit ~ ., data = data_training, method = "glm", metric = "ROC", trControl = trainctrl_rose, family = "binomial")
+LR_model_nr <- train(Crit ~ ., data = data_training, method = "glm", metric = "ROC", trControl = trainctrl_nr, family = "binomial")
+# L1 normed Logistic Regression
+L1LR_model_Grid=expand.grid(
+              .alpha=1,
+              .lambda=seq(0, 100, by = 0.1))
+L1LR_model_rose <- train(Crit ~ ., data = data_training, method = "glmnet", metric = "ROC", trControl = trainctrl_rose, tuneGrid = L1LR_model_Grid)
+L1LR_model_nr <- train(Crit ~ ., data = data_training, method = "glmnet", metric = "ROC", trControl = trainctrl_nr, tuneGrid = L1LR_model_Grid)
+# L2 normed Logistic Regression
+L2LR_model_Grid=expand.grid(
+              .alpha=0,
+              .lambda=seq(0, 100, by = 0.1))
+L2LR_model_rose <- train(Crit ~ ., data = data_training, method = "glmnet", metric = "ROC", trControl = trainctrl_rose, tuneGrid = L2LR_model_Grid)
+L2LR_model_nr <- train(Crit ~ ., data = data_training, method = "glmnet", metric = "ROC", trControl = trainctrl_nr, tuneGrid = L2LR_model_Grid)
+```
+
+## Testset performance
+```{r Model comparison test set evaluation, eval=TRUE, echo=TRUE}
+# GBM
+GBM_Prediction_ROSE<-predict(gbm_tree_auto_rose, newdata=data_test,type = "prob")$Yes
+GBM_Prediction_DEFAULT<-predict(gbm_tree_auto_nr, newdata=data_test,type = "prob")$Yes
+# Decision Tree
+DT_Prediction_ROSE<-predict(DT_model_rose, newdata=data_test,type = "prob")$Yes
+DT_Prediction_DEFAULT<-predict(DT_model_nr, newdata=data_test,type = "prob")$Yes
+# Random Forest
+RF_Prediction_ROSE<-predict(RF_model_rose, newdata=data_test,type = "prob")$Yes
+RF_Prediction_DEFAULT<-predict(RF_model_nr, newdata=data_test,type = "prob")$Yes
+# Logistic Regression
+LR_Prediction_ROSE<-predict(LR_model_rose, newdata=data_test,type = "prob")$Yes
+LR_Prediction_DEFAULT<-predict(LR_model_nr, newdata=data_test,type = "prob")$Yes 
+# L1 normed Logistic Regression
+L1LR_Prediction_ROSE<-predict(L1LR_model_rose, newdata=data_test,type = "prob")$Yes 
+L1LR_Prediction_DEFAULT<-predict(L1LR_model_nr, newdata=data_test,type = "prob")$Yes 
+# L2 normed Logistic Regression
+L2LR_Prediction_ROSE<-predict(L2LR_model_rose, newdata=data_test,type = "prob")$Yes 
+L2LR_Prediction_DEFAULT<-predict(L2LR_model_nr, newdata=data_test,type = "prob")$Yes 
+
+#combine prediction into one dataset
+multi_model_predictions<-cbind.data.frame(GT=data_test$Crit,GBM_Prediction_ROSE,GBM_Prediction_DEFAULT,DT_Prediction_ROSE,DT_Prediction_DEFAULT,RF_Prediction_ROSE,RF_Prediction_DEFAULT,LR_Prediction_ROSE,LR_Prediction_DEFAULT,L1LR_Prediction_ROSE,L1LR_Prediction_DEFAULT,L2LR_Prediction_ROSE,L2LR_Prediction_DEFAULT)
+multi_model_predictions<-pivot_longer(multi_model_predictions,!GT,values_to = "Prediction",names_to = c("Model","Sampling"),names_sep = "_Prediction_" )
+#draw ROC curves
+ROC_comparison_plot<-ggplot(multi_model_predictions,aes(d=ifelse(GT=="Yes",1,0),m=Prediction,color=Model,linetype=Sampling))+geom_roc(labels=F,n.cuts = 0)+geom_abline(slope=1,color="blue",alpha=0.2,linetype = "dashed")+scale_x_continuous(limits = c(0,1),expand = c(0,0),labels = c("0","25","50","75","100") )+scale_y_continuous(limits = c(0,1),expand = c(0,0),labels = c("0","25","50","75","100"))+ggplot_theme+xlab("False positive fraction (%)")+ylab("True positive fraction (%)")+facet_wrap(~Model)+theme( strip.background = element_blank(),panel.spacing.x=unit(1, "lines") , plot.margin = margin(t = 0, r = 0.8, b = 0, l = 0, unit = "lines"))
+ROC_comparison_plot
+#Display AUCs
+multi_model_predictions%>%select(Model,Sampling)%>%unique()%>%arrange(Model,Sampling)%>%rownames_to_column("group")%>%mutate(group=as.numeric(group))%>%left_join(calc_auc(ROC_comparison_plot),by="group")
+#End Parallel Computation
+stopCluster(cl)
+registerDoSEQ()
+```

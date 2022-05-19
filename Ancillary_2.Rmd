@@ -1,0 +1,352 @@
+---
+title: "Forecasting football injuries by combining screening, monitoring and machine learning - 2/4 Ancillary Data analysis: Leaky folds"
+author: "Anne Hecksteden & Georges Pierre Schmartz"
+date: "17 May 2022"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: FALSE
+      smooth_scroll: FALSE
+    toc_depth: 5
+
+---
+
+```{r setup, echo=TRUE,message=FALSE,warning=FALSE}
+# clean workspace if needed
+rm(list = ls())
+source("utils.R")
+data<-get_main_data()
+data_test<-data$data_test
+data_training<-data$data_training 
+
+# Work with multiple threads (use all of the available ones)
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl)
+```
+
+# Ancillary analysis 2: Information Leakage
+
+In Monitoring datasets, timepoints are nested within players. This hierarchical structure has to be considered when setting up cross-validation, specifically cross-validation folds must be constructed on the level of players - not datapoints. Otherwise leaking of information between folds can lead to a spurious increase in cross-validation performance metrics (which does not generalize to test set performance or future data). 
+
+Another potential cause of information leakage and inflated cross-validation performance is the timepoint of upsampling. When upsampling the training set before cross-validation, resamples or descendants of the same case will be included in several folds (and therefore used for training and testing the same model). Therefore, in the main analysis of this work, upsampling is integrated into cross-validation. 
+
+Of note, the magnitude of the respective effects of these two potential sources of information leakage are dependent on the characteristics of the use-case including the structure of the dataset and the details of the analytical procedures. 
+
+The above aspects are not generally considered in previous work, complicating the comparison of cross-validation results. This ancillary analysis aims to demonstrate these considerations and probe their relevance for the specific case of our dataset.Three variations of the main analysis are presented
+
+2a) Upsampling integrated into cross validation (as in main analysis) but no consideration of hierarchical data structure
+
+2b) Upsampling outside cross-validation
+
+2c) Upsampling outside cross-validation and no consideration of hierarchical data structure (combines both potential leaks)
+
+In short, the results indicate that when only one of the two potential information-leaks is "open" (variant 2a and 2b) model performance is not to far off the results of the main analysis. However, marked overfitting is observed when the two leaks are combined (variant 2c)
+
+# 2a) Main model - but no consideration of hierarchical data structure 
+
+## Fit gradient-boosted model 
+
+```{r Fit 2a, eval=TRUE, echo=TRUE}
+
+trainctrl_leaky <- trainControl(method = "repeatedcv", number = data$player_in_training, repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE, sampling = rose_upsampling)  # no index argument (CV_folds not used)!
+
+set.seed(42)
+gbm_tree_auto_leaky1 <- train(Crit ~ ., data = data_training, method = "gbm", metric = "ROC", trControl = trainctrl_leaky, verbose = FALSE, tuneGrid = gbmGrid) 
+
+# Show model
+gbm_tree_auto_leaky1
+
+#End Parallel Computation
+stopCluster(cl)
+registerDoSEQ()
+```
+
+## Get cross-validation performance metrics
+### ROC curve
+```{r CV leaky 1, eval=TRUE, echo=TRUE}
+# Work with multiple threads (use all of the available ones)
+gc()
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl)
+
+# Extract from fit object
+predicted <- as.data.frame(gbm_tree_auto_leaky1$pred$pred)
+observed <- as.data.frame(gbm_tree_auto_leaky1$pred$obs)
+prob_no <- as.data.frame(gbm_tree_auto_leaky1$pred$No)
+prob_yes <- as.data.frame(gbm_tree_auto_leaky1$pred$Yes)
+
+# ROC curve and AUC
+cv_roc_leaky1 <- cbind(predicted, observed, prob_no, prob_yes)
+names(cv_roc_leaky1) <- c("pred", "obs", "prob_no", "prob_yes")
+
+
+cv_roc_leaky1$obs_i <- cv_roc_leaky1$obs == "Yes"
+
+temporary<-generate_rocs(cv_roc_leaky1)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+### Discrimination - violin plots
+```{r Leaky violin, eval=TRUE, echo=TRUE}
+violin_plot(cv_roc_leaky1)
+```
+
+
+## Get testset predictions
+```{r Leaky test pred, eval=TRUE, echo=TRUE}
+
+# Apply to test set
+Predicted_leaky1 <- predict(gbm_tree_auto_leaky1, newdata=data_test)
+
+# View predictions for the test set
+Predicted_leaky1 <- data.frame(Predicted_leaky1)
+
+# Merge with testset
+data_test_plus_leaky1 <- cbind(data_test, Predicted_leaky1)
+data_test_plus_leaky1$Predicted_leaky1 <- factor(data_test_plus_leaky1$Predicted_leaky1, levels = c("No", "Yes"))
+
+# Check confusion matrix
+table(data_test_plus_leaky1$Crit, data_test_plus_leaky1$Predicted_leaky1)
+
+
+## Get probabilities
+Predicted_leaky1p <- predict(gbm_tree_auto_leaky1, newdata=data_test, type = "prob")
+colnames(Predicted_leaky1p) <- c("prob_no", "prob_yes") 
+
+# Merge
+data_test_plus_leaky1 <- cbind(data_test_plus_leaky1, Predicted_leaky1p)
+
+# Plot
+ggplot(data_test_plus_leaky1, aes(x=Crit, y=prob_yes, color = Crit))+ geom_jitter(alpha=0.1,size=0.6,shape=16)+ geom_boxplot(outlier.shape = NA,fill=NA)   + ggtitle("Probs. for test set")+guides(color="none")+ggplot_theme+scale_y_continuous(expand=c(0,0),limits = c(0,1))
+
+ggplot(data_test_plus_leaky1, aes(x=Day_in_study, y=prob_yes) ) + geom_line() +facet_wrap(~ID,ncol = 3) +scale_y_continuous(limits = c(0,1),breaks = c(0,0.5,1))+ggplot_theme+theme(strip.background = element_blank(),strip.text = element_text(size=6),panel.spacing = unit(0, "lines"))+scale_x_continuous(expand=c(0,0))
+
+```
+ 
+## Testset performance
+### ROC curve
+```{r Leaky test ROC, eval=TRUE, echo=TRUE}
+temporary<-generate_rocs(data_test_plus_leaky1)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+# 2b) Upsampling outside cross-validation 
+
+In this variant descendants of the same case are present in different folds, however, the nesting of time-points within players is respected by performing cross-validation on the level of players. In other words: Compared to variation 2a the other potential information leakage is "open". 
+
+## Fit gradient-boosted model with data upsampled outside cross-validation. 
+
+```{r Fit outside_rose, eval=TRUE, echo=TRUE}
+data_training<-ROSE(Crit ~ ., data = data$data_training_wids, N = 50000, seed = 42)$data
+player_in_training<-length(unique(data_training$ID))
+CV_folds<-groupKFold(data_training$ID, k = player_in_training) 
+data_training<-select(data_training,!ID)
+
+trainctrl_out <- trainControl(method = "repeatedcv", number = player_in_training, repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE,index=CV_folds)  # no upsampling specified since it is already included in the training data
+
+set.seed(42)
+gbm_tree_auto_out <- train(Crit ~ ., data = data_training, method = "gbm", metric = "ROC", trControl = trainctrl_out, verbose = FALSE, tuneGrid = gbmGrid) 
+
+# Show model
+gbm_tree_auto_out
+
+#End Parallel Computation
+stopCluster(cl)
+registerDoSEQ()
+```
+
+
+## Get cross-validation performance metrics
+### ROC curve
+```{r CV out, eval=TRUE, echo=TRUE}
+# Work with multiple threads (use all of the available ones)
+gc()
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl)
+
+# Extract from fit object
+predicted <- as.data.frame(gbm_tree_auto_out$pred$pred)
+observed <- as.data.frame(gbm_tree_auto_out$pred$obs)
+prob_no <- as.data.frame(gbm_tree_auto_out$pred$No)
+prob_yes <- as.data.frame(gbm_tree_auto_out$pred$Yes)
+
+# ROC curve and AUC
+cv_roc_out <- cbind(predicted, observed, prob_no, prob_yes)
+names(cv_roc_out) <- c("pred", "obs", "prob_no", "prob_yes")
+
+
+cv_roc_out$obs_i <- cv_roc_out$obs == "Yes"
+
+temporary<-generate_rocs(cv_roc_out)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+### Discrimination - violin plots
+```{r out violin-plots, eval=TRUE, echo=TRUE}
+violin_plot(cv_roc_out)
+```
+
+
+## Get testset predictions
+
+```{r out test predictions, eval=TRUE, echo=TRUE}
+
+# Apply to test set
+Predicted_out <- predict(gbm_tree_auto_out, newdata=data_test)
+
+# View predictions for the test set
+Predicted_out <- data.frame(Predicted_out)
+
+# Merge with testset
+data_test_plus_out <- cbind(data_test, Predicted_out)
+data_test_plus_out$Predicted_out <- factor(data_test_plus_out$Predicted_out, levels = c("No", "Yes"))
+
+# Check confusion matrix
+table(data_test_plus_out$Crit, data_test_plus_out$Predicted_out)
+
+
+## Get probabilities
+Predicted_outp <- predict(gbm_tree_auto_out, newdata=data_test, type = "prob")
+colnames(Predicted_outp) <- c("prob_no", "prob_yes") 
+
+# Merge
+data_test_plus_out <- cbind(data_test_plus_out, Predicted_outp)
+
+# Plot
+ggplot(data_test_plus_out, aes(x=Crit, y=prob_yes, color = Crit))+ geom_jitter(alpha=0.1,size=0.6,shape=16)+ geom_boxplot(outlier.shape = NA,fill=NA)   + ggtitle("Probs. for test set")+guides(color="none")+ggplot_theme+scale_y_continuous(expand=c(0,0),limits = c(0,1))
+
+ggplot(data_test_plus_out, aes(x=Day_in_study, y=prob_yes) ) + geom_line() +facet_wrap(~ID,ncol = 3) +scale_y_continuous(limits = c(0,1),breaks = c(0,0.5,1))+ggplot_theme+theme(strip.background = element_blank(),strip.text = element_text(size=6),panel.spacing = unit(0, "lines"))+scale_x_continuous(expand=c(0,0))
+
+```
+ 
+## Testset performance
+#### ROC curve
+```{r out test ROC curve, eval=TRUE, echo=TRUE}
+temporary<-generate_rocs(data_test_plus_out)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+
+# 2c) Upsampling outside cross-validation AND hierarchy not considered
+
+In this variation of the analysis both potential sources of information leakage are combined (leading to marked inflation of cv-performance metrics)
+
+## Fit gradient-boosted model  
+
+```{r Fit without index, eval=TRUE, echo=TRUE}
+
+trainctrl_leaky <- trainControl(method = "repeatedcv", number = player_in_training, repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE)  # no index argument (CV_folds not used)!
+
+set.seed(42)
+gbm_tree_auto_leaky <- train(Crit ~ ., data = data_training, method = "gbm", metric = "ROC", trControl = trainctrl_leaky, verbose = FALSE, tuneGrid = gbmGrid) 
+
+# Show model
+gbm_tree_auto_leaky
+
+#End Parallel Computation
+stopCluster(cl)
+registerDoSEQ()
+```
+
+## Get cross-validation performance metrics
+### ROC curve
+```{r CV leaky, eval=TRUE, echo=TRUE}
+# Work with multiple threads (use all of the available ones)
+gc()
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl)
+
+# Extract from fit object
+predicted <- as.data.frame(gbm_tree_auto_leaky$pred$pred)
+observed <- as.data.frame(gbm_tree_auto_leaky$pred$obs)
+prob_no <- as.data.frame(gbm_tree_auto_leaky$pred$No)
+prob_yes <- as.data.frame(gbm_tree_auto_leaky$pred$Yes)
+
+# ROC curve and AUC
+cv_roc_leaky <- cbind(predicted, observed, prob_no, prob_yes)
+names(cv_roc_leaky) <- c("pred", "obs", "prob_no", "prob_yes")
+
+
+cv_roc_leaky$obs_i <- cv_roc_leaky$obs == "Yes"
+
+temporary<-generate_rocs(cv_roc_leaky)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+### Discrimination - violin plots
+```{r Leaky violin-plots, eval=TRUE, echo=TRUE}
+violin_plot(cv_roc_leaky)
+```
+
+
+## Get testset predictions
+
+```{r Leaky test predictions, eval=TRUE, echo=TRUE}
+
+# Apply to test set
+Predicted_leaky <- predict(gbm_tree_auto_leaky, newdata=data_test)
+
+# View predictions for the test set
+Predicted_leaky <- data.frame(Predicted_leaky)
+
+# Merge with testset
+data_test_plus_leaky <- cbind(data_test, Predicted_leaky)
+data_test_plus_leaky$Predicted_leaky <- factor(data_test_plus_leaky$Predicted_leaky, levels = c("No", "Yes"))
+
+# Check confusion matrix
+table(data_test_plus_leaky$Crit, data_test_plus_leaky$Predicted_leaky)
+
+
+## Get probabilities
+Predicted_leakyp <- predict(gbm_tree_auto_leaky, newdata=data_test, type = "prob")
+colnames(Predicted_leakyp) <- c("prob_no", "prob_yes") 
+
+# Merge
+data_test_plus_leaky <- cbind(data_test_plus_leaky, Predicted_leakyp)
+
+# Plot
+ggplot(data_test_plus_leaky, aes(x=Crit, y=prob_yes, color = Crit))+ geom_jitter(alpha=0.1,size=0.6,shape=16)+ geom_boxplot(outlier.shape = NA,fill=NA)   + ggtitle("Probs. for test set")+guides(color="none")+ggplot_theme+scale_y_continuous(expand=c(0,0),limits = c(0,1))
+
+ggplot(data_test_plus_leaky, aes(x=Day_in_study, y=prob_yes) ) + geom_line() +facet_wrap(~ID,ncol = 3) +scale_y_continuous(limits = c(0,1),breaks = c(0,0.5,1))+ggplot_theme+theme(strip.background = element_blank(),strip.text = element_text(size=6),panel.spacing = unit(0, "lines"))+scale_x_continuous(expand=c(0,0))
+
+```
+ 
+## Testset performance
+### ROC curve
+```{r Leaky test ROC curve, eval=TRUE, echo=TRUE}
+temporary<-generate_rocs(data_test_plus_leaky)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+

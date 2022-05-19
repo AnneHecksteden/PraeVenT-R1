@@ -1,0 +1,413 @@
+---
+title: "Forecasting football injuries by combining screening, monitoring and machine learning - Main Data analysis"
+author: "Anne Hecksteden & Georges Pierre Schmartz"
+date: "04 May 2022"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: FALSE
+      smooth_scroll: FALSE
+    toc_depth: 5
+
+---
+
+# Read Me 
+
+This is an R Markdown document which provides reproducible code for the core analyses discussed in the manuscript "Forecasting football injuries by combining screening, monitoring and machine learning". The preparatory steps (data handling and feature engineering) are presented in the supplementary Markdown document 1/2. 
+ 
+Please note: The densely commented code in this document aims to optimize transparency and accessibility - not efficiency of coding and computation. 
+
+# Loading raw data
+
+```{r data, echo=TRUE,message=FALSE,warning=FALSE}
+# clean workspace if needed
+rm(list = ls())
+source("utils.R")
+ggplot_theme<-theme_bw()
+
+# load prepared dataset
+load("data_analyse.RData")
+data <- data_analyse
+
+# Work with multiple threads (use all of the available ones)
+cl <- makePSOCKcluster(ceiling(detectCores()/2))
+registerDoParallel(cl)
+```
+
+
+# Epidemiologal description
+
+## Incidence of acute, non-contact, time-loss injuries
+
+There are 51 criterion injuries in the final dataset. 
+
+```{r Basic epidemiology: criterion injuries, eval=TRUE, echo=TRUE}
+
+# Incidence of criterion injuries (per 1000 hours of exposure)
+## Overall
+table(data$Crit)
+Training_time_overall <- sum(data$Training_time)/60
+
+Incidence_overall <- (sum(data$Crit) / (Training_time_overall/1000))
+
+table(data$Crit, data$Matchday)
+
+data_match <- filter(data, Matchday )
+data_training <- filter(data, !Matchday )
+
+Training_time_match <- sum(data_match$Training_time)/60
+Training_time_match
+
+Training_time_training <- sum(data_training$Training_time)/60
+Training_time_training
+
+Incidence_match <- (sum(data_match$Crit) / (Training_time_match / 1000))
+Incidence_training <- (sum(data_training$Crit) / (Training_time_training / 1000))
+
+Inc <- c(Incidence_overall, Incidence_match, Incidence_training)
+Incidence <- as.data.frame(Inc)
+Incidence <- as.data.frame(t(Incidence))
+colnames(Incidence) <- c("Overall", "Match", "Training")
+
+kable(Incidence, caption = "Incidence of criterion injuries per 1000 hours of exposure", digits = 2, align = "c")
+
+```
+
+## Incidence of time-loss injuries 
+
+As recommended for comparison with other studies.
+There are 93 time-loss injuries in the final dataset
+
+```{r Basic epidemiology: time-loss injuries, eval=TRUE, echo=TRUE}
+# Incidence of time-loss injuries (per 1000 hours of exposure)
+## Overall
+table(data$TL_injury)
+Training_time_overall <- sum(data$Training_time)/60
+Incidence_overall <- (sum(data$TL_injury) / (Training_time_overall/1000))
+
+table(data$TL_injury, data$Matchday)
+
+data_match <- filter(data, Matchday )
+data_training <- filter(data, !Matchday)
+
+Training_time_match <- sum(data_match$Training_time)/60
+Training_time_match
+
+Training_time_training <- sum(data_training$Training_time)/60
+Training_time_training
+Incidence_match <- (sum(data_match$TL_injury) / (Training_time_match / 1000))
+Incidence_training <- (sum(data_training$TL_injury) / (Training_time_training / 1000))
+
+Inc <- c(Incidence_overall, Incidence_match, Incidence_training)
+Incidence <- as.data.frame(Inc)
+Incidence <- as.data.frame(t(Incidence))
+colnames(Incidence) <- c("Overall", "Match", "Training")
+
+kable(Incidence, caption = "Incidence of time-loss injuries per 1000 hours of exposure", digits = 2, align = "c")
+
+```
+
+# Main analysis 
+
+## Train-test split
+
+Allocation by player, maintain proportion of players who sustain a criterion injury vs. those who do not ("Victim"). 
+
+```{r Main train-test split, eval=TRUE, echo=TRUE}
+# Get set of "unique" IDs
+data_unique <- distinct(data, ID, .keep_all = TRUE) 
+
+#Get IDs for train and test sets 
+tr_prop = 0.75    # proportion of full dataset to use for training
+
+training_set = ddply(data_unique, .(Victim), function(., seed) { set.seed(seed); .[sample(1:nrow(.), trunc(nrow(.) * tr_prop)), ] }, seed = 42)
+
+training_IDs <- as.vector(training_set$ID)
+
+#change all boolean variables to factors for ROSE algorithm
+boolean_cols<-setNames(as.logical(lapply(data,is.logical)),colnames(data))
+data[boolean_cols]<-lapply(data[boolean_cols],factor,labels = c("No","Yes"),levels = c(F,T))
+
+# Use vector with training IDs to split full dataset
+data_training <- filter(data, ID %in% training_IDs)
+data_test <- filter(data, !(ID%in% training_IDs))
+
+# Check for size and number of "victims"
+table(data_unique$Victim)
+table(data_training$Victim)
+table(data_test$Victim)
+
+# Subset to variables used in the model (reduce number of variables for upsampling and remove "Victim")
+subset <- c("ID", "Crit", "After_RTP", "Age", "Pos_code", "VV_resid_age", "Fat", "IAT", "Sprint_30", "SIMS_score", "SIMS_pain", "Srpe_7d_robust", "Matchday", "Srpe_team_avg", "KEB_AB_robust")
+
+# Alternative subset monitoring +
+#subset <- c("ID", "Crit", "After_RTP", "Age", "Pos_code", "VV_resid_age", "Srpe_7d_robust", "Matchday", "Srpe_team_avg", "KEB_AB_robust")
+
+# Alternative subset monitoring only
+# subset <- c("ID", "Crit", "After_RTP", "Srpe_7d_robust", "Matchday", "Srpe_team_avg", "KEB_AB_robust")
+
+data_training <- subset(data_training, select = subset)
+
+# Generate cross-validation folds index and remove ID
+CV_folds<-groupKFold(data_training$ID, k = length(unique(data_training$ID))) 
+data_training<-select(data_training, !ID)
+
+# Check
+table(data_training$Crit)
+```
+
+## Upsampling
+
+To compensate for the marked underrepresentation of the minority class (days with occurence of a criterion injury) a balanced, synthetic training set is generated by upsampling the original training set according to the ROSE method. 
+
+```{r Main upsampling, eval=TRUE, echo=TRUE}
+rose_upsampling
+```
+
+## Fit gradient boosted model 
+
+Model fitting with leave-one-player-out stratified cross-validation using the upsampled training set. 
+
+```{r Main model fitting, eval=TRUE, echo=TRUE}
+trainctrl <- trainControl(method = "repeatedcv", number = length(training_IDs), repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE, index=CV_folds,sampling = rose_upsampling) 
+
+gbmGrid <-    expand.grid(interaction.depth = 2^(0:4), 
+                          n.trees = (1:15)*25, 
+                          shrinkage = 0.1, 
+                          n.minobsinnode = 10) 
+
+set.seed(42)
+gbm_tree_auto <- train(Crit ~ ., data = data_training, method = "gbm", metric = "ROC", trControl = trainctrl, verbose = FALSE, tuneGrid = gbmGrid) 
+
+# Show model
+gbm_tree_auto
+```
+
+### Get cross-validation performance metrics
+#### ROC curve 
+
+```{r ROC curve main cv, eval=TRUE, echo=TRUE}
+
+# Extract from fit object
+predicted <- as.data.frame(gbm_tree_auto$pred$pred)
+observed <- as.data.frame(gbm_tree_auto$pred$obs)
+prob_no <- as.data.frame(gbm_tree_auto$pred$No)
+prob_yes <- as.data.frame(gbm_tree_auto$pred$Yes)
+
+# Assemble and reformat cv results
+cv_roc <- cbind(predicted, observed, prob_no, prob_yes)
+names(cv_roc) <- c("pred", "obs", "prob_no", "prob_yes")
+cv_roc$obs_i <- cv_roc$obs == "Yes"
+
+temporary<-generate_rocs(cv_roc)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+#### Brier score
+```{r Brier score main cv, eval=TRUE, echo=TRUE}
+temporary<-compute_brier(cv_roc)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+  
+temporary$Brier_ci
+```
+### Calibration plot
+
+```{r Calibration plot main cv, eval=TRUE, echo=TRUE}
+temporary<-generate_calibration_plot(input_data = cv_roc,recalibration_data = data_training)
+# Calibration plot for raw probability predictions
+temporary[["calibration"]]
+## Check
+temporary[["recalibration_check"]]
+
+# Calibration plot after recalibration 
+temporary[["recalibrated_calibration"]]
+```
+#### Discimination - Violin plot
+
+```{r Main cv violin-plots, eval=TRUE, echo=TRUE}
+violin_plot(cv_roc)
+```
+
+### Feature importance
+
+```{r Main feature importance, eval=TRUE, echo=TRUE}
+plot_varimp(gbm_tree_auto)
+```
+
+### Get testset predictions
+
+```{r Main test set, eval=TRUE, echo=TRUE}
+
+# Apply to test set
+Predicted_1 <- predict(gbm_tree_auto, newdata=data_test)
+
+# View predictions for the test set
+Predicted_1b <- data.frame(Predicted_1)
+
+# Merge with testset
+data_test_plus <- cbind(data_test, Predicted_1b)
+data_test_plus$Predicted_1 <- factor(data_test_plus$Predicted_1, levels = c("No", "Yes"))
+
+# Check confusion matrix
+table(data_test_plus$Crit, data_test_plus$Predicted_1)
+
+# Get probabilities
+Predicted_1p <- predict(gbm_tree_auto, newdata=data_test, type = "prob")
+colnames(Predicted_1p) <- c("prob_no", "prob_yes") 
+
+# Merge
+data_test_plus <- cbind(data_test_plus, Predicted_1p)
+data_test_plus$Predicted <- factor(data_test_plus$Predicted, levels = c("No", "Yes"))
+
+# Plot
+ggplot(data_test_plus, aes(x=Crit, y=prob_yes, color = Crit))+ geom_jitter(alpha=0.1,size=0.6,shape=16)+ geom_boxplot(outlier.shape = NA,fill=NA)   + ggtitle("Probs. for test set")+guides(color="none")+ggplot_theme+scale_y_continuous(expand=c(0,0),limits = c(0,1))
+
+ggplot(data_test_plus, aes(x=Day_in_study, y=prob_yes) ) + geom_line() +facet_wrap(~ID,ncol = 3) +scale_y_continuous(limits = c(0,1),breaks = c(0,0.5,1))+ggplot_theme+theme(strip.background = element_blank(),strip.text = element_text(size=6),panel.spacing = unit(0, "lines"))+scale_x_continuous(expand=c(0,0))
+
+
+
+```
+ 
+## Testset performance
+### ROC curve
+
+```{r ROC curve main test, eval=TRUE, echo=TRUE}
+temporary<-generate_rocs(data_test_plus)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+### Brier score
+```{r Main test Brier, eval=TRUE, echo=TRUE}
+
+data_test_plus$CritL <- data_test_plus$Crit == "Yes"
+data_test_plus$CritL <- as.numeric(data_test_plus$CritL)
+
+
+temporary<-compute_brier(data_test_plus)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+  
+temporary$Brier_ci
+```
+### Calibration plot
+
+```{r Calibration plot main test, eval=TRUE, echo=TRUE}
+temporary<-generate_calibration_plot(input_data = data_test_plus,recalibration_data = data_training)
+# Calibration plot for raw probability predictions
+temporary[["calibration"]]
+## Check
+temporary[["recalibration_check"]]
+
+# Calibration plot after recalibration 
+temporary[["recalibrated_calibration"]]
+```
+
+#### Discimination - Violin plot
+
+```{r Main test violin-plots, eval=TRUE, echo=TRUE}
+violin_plot(data_test_plus)
+```
+
+### Predictions on the training set
+
+Predictions are made with the original (non-upsampled) training set
+
+```{r Main training set, eval=TRUE, echo=TRUE}
+
+# ROC curve training set
+## Make predictions with initial (not upsampled) training set
+Predicted_train_1 <- predict(gbm_tree_auto, newdata=data_training)
+
+## View predictions for the training set
+Predicted_train_1b <- data.frame(Predicted_train_1)
+
+## Merge with trainingset
+data_train_plus <- cbind(data_training, Predicted_train_1b)
+data_train_plus$Predicted_train_1 <- factor(data_train_plus$Predicted_train_1, levels = c("No", "Yes"))
+
+## Check confusion matrix
+table(data_train_plus$Crit, data_train_plus$Predicted_train_1)
+
+## Get probabilities
+Predicted_train_1p <- predict(gbm_tree_auto, newdata=data_training, type = "prob")
+colnames(Predicted_train_1p) <- c("prob_no", "prob_yes") 
+
+## Merge
+data_train_plus <- cbind(data_train_plus, Predicted_train_1p)
+
+```
+### Training set performance
+#### ROC curve
+
+```{r ROC curve main train, eval=TRUE, echo=TRUE}
+temporary<-generate_rocs(data_train_plus)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+#### Brier score
+```{r Main train Brier, eval=TRUE, echo=TRUE}
+
+data_train_plus$CritL <- data_train_plus$Crit == "Yes"
+data_train_plus$CritL <- as.numeric(data_train_plus$CritL)
+
+temporary<-compute_brier(data_train_plus)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+  
+temporary$Brier_ci
+```
+#### Calibration plot 
+
+```{r Calibration plot main train, eval=TRUE, echo=TRUE}
+temporary<-generate_calibration_plot(input_data = data_train_plus,recalibration_data = data_training)
+# Calibration plot for raw probability predictions
+temporary[["calibration"]]
+## Check
+temporary[["recalibration_check"]]
+
+# Calibration plot after recalibration 
+temporary[["recalibrated_calibration"]]
+```
+
+#### Discimination - Violin plot
+```{r Main training violin-plot, eval=TRUE, echo=TRUE}
+violin_plot(data_train_plus)
+#End Parallel Computation
+stopCluster(cl)
+registerDoSEQ()
+```
+
